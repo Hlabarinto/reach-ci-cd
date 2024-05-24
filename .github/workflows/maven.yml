@@ -1,0 +1,139 @@
+name: Reach API
+
+on:
+  push:
+    branches: [ "main", "prod" ]
+  pull_request:
+    branches: [ "main", "prod" ]
+
+  workflow_dispatch:
+    inputs:
+      s3_uri:
+        description: 'The .tar.gz file S3 URI where Reach docker files are saved'
+        required: true
+      environment:
+        description: 'Select AWS credentials based on the environment [NonProd|Prod]'
+        required: true
+
+
+
+env:
+  OCTOPUS_SERVER_SPACE: CIB IB
+  PROJECT_NAME: Reach API
+  AWS_REGION: eu-west-1
+  ECR_BASE_URL: 203646284770.dkr.ecr.eu-west-1.amazonaws.com
+
+  
+jobs:
+
+  build:
+    name: Build Docker image
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+      
+    - name: Set up JDK 22
+      uses: actions/setup-java@v3
+      with:
+        java-version: '22'
+        distribution: 'adopt'
+        cache: maven
+
+    - name: Install Octopus CLI 🐙
+      uses: OctopusDeploy/install-octopus-cli-action@v3
+      with:
+        version: '*'
+
+    - name: Set Version
+      run: echo "PACKAGE_VERSION=$(date +'%Y.%m.%d').$GITHUB_RUN_NUMBER" >> $GITHUB_ENV
+
+    - name: Get Active Branch Name
+      id: extract_branch_name
+      run: echo "BRANCH_NAME={$GITHUB_REF##*/}" >> $GITHUB_ENV
+
+    - name: Display Active Branch
+      run: echo "Active branch is ${{ env.BRANCH_NAME }}"
+
+    - name: Assign AWS credentials based on branch
+      run: |
+        if [[ ${{ env.BRANCH_NAME }} == *"main"* ]]; then
+            echo "############# Assigning NonProd AWS Credentials #############"
+            echo "AWS_ACCESS_KEY_ID=${{ secrets.REACH_UAT_AWS_ACCESS_KEY_ID }}" >> $GITHUB_ENV
+            echo "AWS_SECRET_ACCESS_KEY=${{secrets.REACH_UAT_AWS_SECRET_ACCESS_KEY }}" >> $GITHUB_ENV
+        elif [[ ${{ env.BRANCH_NAME }} == *"prod"* ]]; then
+            echo "############# Assigning Prod AWS Credentials #############"
+            echo "AWS_ACCESS_KEY_ID=${{secrets.REACH_PRD_AWS_ACCESS_KEY_ID}}" >> $GITHUB_ENV
+            echo "AWS_SECRET_ACCESS_KEY=${{secrets.REACH_PRD_AWS_SECRET_ACCESS_KEY}}" >> $GITHUB_ENV
+        fi
+        
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v1
+      with:
+        aws-access-key-id: ${{ env.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ env.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+          
+    - name: Build with Maven
+      run: |
+        mvn clean
+        mvn -B package --file pom.xml
+
+    - name: Build docker image and save the image into tar.gz
+      id: build_docker_image
+      run: |
+        if [[ ${{ github.event_name }} == 'workflow_dispatch' ]]; then
+            tar xf ${{ github.event.inputs.s3_uri }} -C temp_folder
+            
+        else
+            docker build -f src/main/docker/Dockerfile.jvm -t ${{ env.ECR_BASE_URL }}/reach-ci-cd-jvm .
+            docker save -o reach_docker_image.tar ${{ env.ECR_BASE_URL }}/reach-ci-cd-jvm
+            tar -czvf reach_docker_image.${{ env.PACKAGE_VERSION }}.tar.gz reach_docker_image.tar
+            echo "output_folder=./reach_docker_image.${{ env.PACKAGE_VERSION }}.tar.gz" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Upload Zip package 🐙
+      uses: actions/upload-artifact@v3
+      with:
+          package_id: ${{ env.PROJECT_NAME}}
+          version: ${{ env.PACKAGE_VERSION }}
+          name: ${{ env.ECR_BASE_URL }}-${{ github.event.repository.name }}
+          path: ${{ steps.build_docker_image.outputs.output_folder }}
+
+    - name: Push Artifacts to Octopus Deploy 🐙
+      env:
+        PACKAGE_VERSION: ${{ env.PACKAGE_VERSION }}
+      uses: OctopusDeploy/push-package-action@v3
+      with:
+        api_key: ${{ secrets.OCTOPUS_SERVER_API_KEY }}
+        server: ${{ secrets.OCTOPUS_SERVER_URL }}
+        space: ${{ env.OCTOPUS_SERVER_SPACE }}
+        packages: ${{ steps.build_docker_image.outputs.output_folder }}
+        use_delta_compression: false
+        overwrite_mode: OverwriteExisting
+
+    - name: Push build information to Octopus Deploy 🐙
+      uses: OctopusDeploy/push-build-information-action@v3
+      with:
+        api_key: ${{ secrets.OCTOPUS_SERVER_API_KEY }}
+        server: ${{ secrets.OCTOPUS_SERVER_URL }}
+        space: ${{ env.OCTOPUS_SERVER_SPACE }}
+        packages: ${{ steps.build_docker_image.outputs.output_folder }}
+        version: ${{ env.PACKAGE_VERSION }}
+
+  create-release:
+    name: Create Octopus Release
+    runs-on: ubuntu-latest
+    needs: [build]
+    steps:
+
+      - name: Create and deploy release
+        env:
+          PACKAGE_VERSION: ${{ env.PACKAGE_VERSION }}
+        uses: OctopusDeploy/create-release-action@v3
+        with:
+          api_key: ${{ secrets.OCTOPUS_SERVER_API_KEY }}
+          server: ${{ secrets.OCTOPUS_SERVER_URL }}
+          space: ${{ env.OCTOPUS_SERVER_SPACE }}
+          project: ${{ env.PROJECT_NAME}}
